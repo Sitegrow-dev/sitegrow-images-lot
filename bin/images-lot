@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# images-lot <folder> [options]: creates a batch of realistic photos for a site.
+#   <folder>/decor.txt   shared setting (English text) OR the name of a saved setting in decors/ (e.g. aquarium)
+#   <folder>/photos.tsv  one line per photo: seo-name <TAB> subject in English [<TAB> camera angle]
+# Options:
+#   --redo <name>     regenerate only this photo (rejected at review)   (alias --refaire)
+#   --size <s>        size in Ralph's tool (default original = 4:3 1448x1086; blog, og, square...) (alias --taille)
+#   --framing "<t>"   framing asked to Codex (default "4:3 horizontal")  (alias --cadre)
+#   --alts <langs>    draft alt texts, e.g. en,fr (default en); --no-alts to skip
+#   --sheet           rebuild only the contact sheet                     (alias --planche)
+# Output: <folder>/photos/<name>.webp, alts.tsv, contact-sheet.html + contact-sheet.jpg, logs/<name>.log
+# Each photo: Codex (ChatGPT account) -> Ralph's tool -> exact AI label check.
+# Running it again resumes where it stopped. Only one batch at a time per machine (lock).
+set -euo pipefail
+HERE=$(dirname "$(readlink -f "$0")"); LIB=$HERE/../lib; DECORS=$HERE/../decors
+STATE=~/.sitegrow-images-lot; mkdir -p "$STATE"
+aide() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+[ $# -ge 1 ] || aide 2
+case "$1" in -h|--help) aide 0;; esac
+DIR=$(realpath "$1"); shift
+REFAIRE=""; TAILLE=original; CADRE="4:3 horizontal"; ALTS=en; SHEET_ONLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --redo|--refaire) REFAIRE=$2; shift 2;;
+    --size|--taille) TAILLE=$2; shift 2;;
+    --framing|--cadre) CADRE=$2; shift 2;;
+    --alts) ALTS=$2; shift 2;;
+    --no-alts|--sans-alts) ALTS=""; shift;;
+    --sheet|--planche) SHEET_ONLY=1; shift;;
+    -h|--help) aide 0;;
+    *) echo "unknown option: $1" >&2; aide 2;;
+  esac
+done
+[ -f "$DIR/photos.tsv" ] || { echo "missing $DIR/photos.tsv (seo-name <TAB> subject [<TAB> angle])" >&2; exit 2; }
+[ -f "$DIR/decor.txt" ] || { echo "missing $DIR/decor.txt (setting text or name: $(ls "$DECORS" | sed 's/\.txt$//' | tr '\n' ' '))" >&2; exit 2; }
+DECOR=$(cat "$DIR/decor.txt")
+if [ -f "$DECORS/$(echo "$DECOR" | tr -d '[:space:]').txt" ]; then DECOR=$(cat "$DECORS/$(echo "$DECOR" | tr -d '[:space:]').txt"); fi
+mkdir -p "$DIR/photos" "$DIR/logs"
+
+# SEO names: lowercase, digits, hyphens.
+while IFS=$'\t' read -r nom _; do
+  [ -z "$nom" ] || [[ "$nom" == \#* ]] && continue
+  [[ "$nom" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "not an SEO name: \"$nom\" (lowercase, digits, hyphens)" >&2; exit 2; }
+done < "$DIR/photos.tsv"
+
+no_dashes() { perl -CSD -pe 's/(?<=\d)\x{2013}(?=\d)/-/g; s/\s*[\x{2014}\x{2013}\x{2015}]\s*/, /g'; }
+
+generate() { # name subject angle
+  local nom=$1 sujet=$2 angle=$3 out="$DIR/photos/$1.webp" log="$DIR/logs/$1.log"
+  local desc="$DECOR Subject: $sujet.${angle:+ Camera angle: $angle.} Accurate anatomy, true colors and natural posture. Framing: $CADRE."
+  for essai in 1 2; do
+    echo "== attempt $essai $(date '+%F %T')" >> "$log"
+    if "$HERE/image-codex" "$desc" "$out.tmp.webp" "$TAILLE" webp < /dev/null >> "$log" 2>&1 \
+       && python3 "$LIB/check-ai-label.py" "$out.tmp.webp" >> "$log" 2>&1; then
+      mv "$out.tmp.webp" "$out"; return 0
+    fi
+    rm -f "$out.tmp.webp"
+  done
+  return 1
+}
+
+alt() { # name subject: draft alt text, Codex looks at the photo
+  local nom=$1 sujet=$2 img="$DIR/photos/$1.webp" res
+  res=$(cd "$DIR" && timeout 300 codex exec --skip-git-repo-check \
+    "Look at the attached photo. It was made to show: $sujet. Write one alt text per language for these languages: $ALTS. Use the common name of the species or object in each language when the photo really matches it; if it does not match, describe what you see and start the line with CHECK. Do not give exact counts above three (say a group, a school, several). Describe only what is really visible (species or objects, what they do, setting), natural sentence, max 125 characters, no 'image of', no 'photo of', no 'close-up', no dashes of any kind except a plain hyphen inside words. Reply with exactly one line per language, formatted as: code<TAB>alt text" \
+    -i "$img" < /dev/null 2>> "$DIR/logs/$nom.log" | grep -P '^[a-z]{2}\t' || true)
+  [ -n "$res" ] || { echo "   alt: failed (see logs/$nom.log)"; return 0; }
+  awk -F'\t' -v n="$nom" '{print n "\t" $1 "\t" $2}' <<< "$res" | no_dashes >> "$DIR/alts.tsv"
+}
+
+contact_sheet() {
+  python3 - "$DIR" <<'EOF'
+import csv, html, os, sys
+d = sys.argv[1]
+alts = {}
+if os.path.exists(f'{d}/alts.tsv'):
+    for r in csv.reader(open(f'{d}/alts.tsv', encoding='utf-8'), delimiter='\t'):
+        if len(r) >= 3: alts.setdefault(r[0], []).append(f'{r[1]}: {r[2]}')
+cartes = []
+for l in open(f'{d}/photos.tsv', encoding='utf-8'):
+    c = l.rstrip('\n').split('\t')
+    if not c[0] or c[0].startswith('#'): continue
+    nom, sujet = c[0], c[1] if len(c) > 1 else ''
+    ok = os.path.exists(f'{d}/photos/{nom}.webp')
+    img = f'<img src="photos/{nom}.webp" alt="">' if ok else '<div class="vide">FAILED or not done yet</div>'
+    a = ''.join(f'<li>{html.escape(x)}</li>' for x in alts.get(nom, []))
+    cartes.append(f'<figure>{img}<figcaption><b>{nom}</b><span>{html.escape(sujet)}</span><ul>{a}</ul></figcaption></figure>')
+open(f'{d}/contact-sheet.html', 'w', encoding='utf-8').write(f'''<!doctype html><meta charset="utf-8"><title>Contact sheet {html.escape(os.path.basename(d))}</title>
+<style>body{{margin:0;padding:20px;background:#1d1d1b;color:#eee;font:13px system-ui,sans-serif}}
+main{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:18px}}
+figure{{margin:0;background:#2a2a27;border-radius:6px;overflow:hidden}}img,.vide{{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}}
+.vide{{display:grid;place-items:center;background:#5a1e1e}}figcaption{{padding:10px}}b{{display:block;font-size:14px}}span{{color:#aaa}}ul{{padding-left:16px;margin:6px 0 0}}</style>
+<main>{"".join(cartes)}</main>''')
+EOF
+  if command -v browser >/dev/null && [ -f /opt/cobrowser/lib/connect.js ]; then run=(browser run); else run=(node); fi
+  timeout 120 "${run[@]}" "$LIB/contact-sheet.js" "$DIR" > /dev/null 2>&1 || echo "contact-sheet.jpg: screenshot failed (contact-sheet.html is still readable)"
+  echo "Contact sheet: $DIR/contact-sheet.html and $DIR/contact-sheet.jpg"
+}
+
+if [ "$SHEET_ONLY" = 1 ]; then contact_sheet; exit 0; fi
+
+# One batch at a time per machine: Ralph's tool runs in a shared browser.
+exec 9> "$STATE/batch.lock"
+flock -n 9 || { echo "another batch is running: waiting, 2 hours max..."; flock -w 7200 9 || { echo "giving up: lock still held" >&2; exit 1; }; }
+
+if [ -n "$REFAIRE" ]; then
+  grep -qP "^\Q$REFAIRE\E\t" "$DIR/photos.tsv" || { echo "\"$REFAIRE\" is not in photos.tsv" >&2; exit 2; }
+  rm -f "$DIR/photos/$REFAIRE.webp"
+  [ -f "$DIR/alts.tsv" ] && { grep -vP "^\Q$REFAIRE\E\t" "$DIR/alts.tsv" > "$DIR/alts.tsv.tmp" || true; mv "$DIR/alts.tsv.tmp" "$DIR/alts.tsv"; }
+fi
+
+total=0; faites=0; echecs=()
+while IFS=$'\t' read -r nom sujet angle; do
+  [ -z "$nom" ] || [[ "$nom" == \#* ]] && continue
+  [ -n "$REFAIRE" ] && [ "$nom" != "$REFAIRE" ] && continue
+  total=$((total+1))
+  if [ -s "$DIR/photos/$nom.webp" ]; then
+    faites=$((faites+1))
+    # missing alt (earlier failure): redo it without regenerating the photo
+    if [ -n "$ALTS" ] && ! grep -qP "^\Q$nom\E\t" "$DIR/alts.tsv" 2>/dev/null; then echo "$nom: missing alt"; alt "$nom" "$sujet"; fi
+    continue
+  fi
+  echo "$(date +%H:%M:%S) $nom ..."
+  if generate "$nom" "$sujet" "${angle:-}"; then
+    faites=$((faites+1)); echo "   ok"
+    [ -n "$ALTS" ] && alt "$nom" "$sujet"
+  else
+    echecs+=("$nom"); echo "   FAILED (see logs/$nom.log)"
+  fi
+done < "$DIR/photos.tsv"
+
+contact_sheet
+echo "Photos ready: $faites/$total in $DIR/photos"
+[ ${#echecs[@]} -eq 0 ] || { echo "Failed: ${echecs[*]} (run the command again to retry)"; exit 1; }
+echo "TO DO: review the contact sheet, redo inaccurate photos (--redo <name>), check each alt while looking at the photo."

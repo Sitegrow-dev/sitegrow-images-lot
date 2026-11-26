@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# image-ralph <image.png|jpg|webp> <output.webp|jpg> [size] [format]
+# size: original blog square post story landscape hero og pin (default blog = 1200x800)
+# format: webp (default) or jpeg. Sends the image through Ralph's tool, then checks the AI label is gone.
+set -euo pipefail
+HERE=$(dirname "$(readlink -f "$0")"); LIB=$HERE/../lib
+[ $# -ge 2 ] || { sed -n '2,4p' "$0"; exit 2; }
+in=$(realpath "$1"); out=$(realpath -m "$2"); size=${3:-blog}; fmt=${4:-webp}
+case "$size" in original|blog|square|post|story|landscape|hero|og|pin) ;; *) echo "unknown size: $size" >&2; exit 2;; esac
+[ -f "$in" ] || { echo "file not found: $in" >&2; exit 2; }
+if command -v browser >/dev/null && [ -f /opt/cobrowser/lib/connect.js ]; then run=(browser run); else run=(node); fi
+RALPH_IN="$in" RALPH_OUT="$out" RALPH_SIZE="$size" RALPH_FORMAT="$fmt" \
+  timeout 180 "${run[@]}" "$LIB/ralph.js" 2>&1 | grep -v -e '^FOCUS' -e 'FOCUS:' -e '^\[cobrowser\]' || true
+[ -s "$out" ] || { echo "failed: no image written" >&2; exit 1; }
+python3 "$LIB/check-ai-label.py" "$out" >/dev/null || { python3 "$LIB/check-ai-label.py" "$out" >&2; exit 1; }
+echo "OK $out ($(du -h "$out" | cut -f1), no AI label)"

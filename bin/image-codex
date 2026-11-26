@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# image-codex "<photo description in English>" <output.webp> [size] [format]
+# Generates one photo with Codex (ChatGPT account), then sends it through Ralph's tool (image-ralph).
+# Always describe the scene in text: never start from someone else's photo.
+set -euo pipefail
+HERE=$(dirname "$(readlink -f "$0")")
+[ $# -ge 2 ] || { sed -n '2,4p' "$0"; exit 2; }
+desc=$1; out=$(realpath -m "$2"); size=${3:-blog}; fmt=${4:-webp}
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+( cd "$tmp" && timeout 400 codex exec --skip-git-repo-check -o last.txt \
+  "Generate one photorealistic image: $desc No text, no logos, no watermark. Save it and reply with only the file path." < /dev/null > codex.log 2>&1 ) \
+  || { echo "Codex failed:" >&2; tail -5 "$tmp/codex.log" >&2; exit 1; }
+png=$(grep -o '/[^ ]*\.png' "$tmp/last.txt" | head -1 || true)
+[ -n "$png" ] && [ -f "$png" ] || { echo "Codex returned no image:" >&2; cat "$tmp/last.txt" >&2; exit 1; }
+echo "Codex: $png"
+"$HERE/image-ralph" "$png" "$out" "$size" "$fmt"

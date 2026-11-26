@@ -1,0 +1,12 @@
+{
+  "name": "sitegrow-images-lot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Batch of realistic photos for client sites: Codex, Ralph's tool, AI label check, contact sheet",
+  "dependencies": {
+    "playwright": "1.49.1"
+  },
+  "scripts": {
+    "postinstall": "playwright install chromium"
+  }
+}
